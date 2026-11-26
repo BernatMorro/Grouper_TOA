@@ -1330,3 +1330,151 @@ diagnostics8 <- run_diagnostics(models8, fig8_dir)
 
 message("Figures and diagnostic summaries completed.")
 
+# ==============================================================================
+# 11. SUPPLEMENTARY MODEL DIAGNOSTIC FIGURES
+#
+# Generates one six-panel diagnostic figure per model using the fitted models
+# from Sections 6, 7, 9 and 10. 
+# ==============================================================================
+
+draw_diagnostic_composition <- function(result, model_name) {
+  dh <- result$dh
+  obs <- result$obs
+  
+  old_par <- par(mfrow = c(2, 3), mar = c(4.5, 4.2, 4, 1), oma = c(0, 0, 2, 0))
+  on.exit(par(old_par))
+  
+  plot_groups <- function(group, heading, xlab) {
+    old_labels <- par(col.lab = "transparent")
+    on.exit(par(old_labels))
+    DHARMa::testCategorical(dh, catPred = group)
+    mtext(heading, side = 3, line = 2.4, font = 2)
+    mtext(xlab, side = 1, line = 3)
+    mtext("DHARMa residual", side = 2, line = 3)
+  }
+  
+  plot_predictor <- function(predictor, heading, xlab) {
+    DHARMa::plotResiduals(dh, form = predictor, quantreg = FALSE,
+                          rank = FALSE, asFactor = FALSE, smoothScatter = FALSE,
+                          main = "", xlab = xlab)
+    title(main = heading)
+  }
+  
+  DHARMa::plotQQunif(dh, testUniformity = TRUE,
+                     testDispersion = TRUE, testOutliers = FALSE)
+  
+  plot_groups(droplevels(obs$fish_id), "Residuals by fish", "Fish identity")
+  
+  if (length(unique(obs$divers_h)) > 1L) {
+    plot_predictor(obs$divers_h, "Residuals vs diver abundance", "Divers per hour")
+  } else {
+    plot.new()
+    title(main = "Residuals vs diver abundance")
+    text(0.5, 0.5, "Constant diver abundance")
+  }
+  
+  plot_predictor(obs$temperature, "Residuals vs temperature", "Temperature (°C)")
+  
+  month_group <- droplevels(factor(format(obs$local_date, "%m"),
+                                   levels = sprintf("%02d", 1:12), labels = month.abb))
+  if (nlevels(month_group) > 1L) {
+    plot_groups(month_group, "Residuals by month", "Month")
+  } else {
+    hist(dh$scaledResiduals, breaks = seq(0, 1, length.out = 21),
+         probability = TRUE, col = "grey85", border = "white",
+         main = "Residuals by month", xlab = "Scaled residual")
+    abline(h = 1, col = "red", lty = 2)
+  }
+  
+  plot_predictor(obs$hour_index, "Residuals vs elapsed time", "Elapsed hours")
+  
+  mtext(model_name, outer = TRUE, side = 3, line = 0.4, font = 2)
+}
+
+save_diagnostic_compositions <- function(models, folder, figure_name) {
+  dir.create(folder, recursive = TRUE, showWarnings = FALSE)
+  
+  for (model_name in names(models)) {
+    message("Saving diagnostics: ", figure_name, " — ", model_name)
+    result <- make_diagnostic_residuals(models[[model_name]])
+    output_file <- file.path(folder, paste0(model_name, "_DHARMa_diagnostics.png"))
+    
+    png(output_file, width = 2700, height = 1600, res = 180)
+    tryCatch(
+      draw_diagnostic_composition(result, paste(figure_name, model_name, sep = " — ")),
+      finally = dev.off()
+    )
+  }
+}
+
+diagnostic_models <- list("Figure 4" = models4, "Figure 5" = models5,
+                          "Figure 7" = models7, "Figure 8" = models8)
+for (figure_name in names(diagnostic_models)) {
+  save_diagnostic_compositions(diagnostic_models[[figure_name]],
+                               file.path("Diagnostics", figure_name), figure_name)
+}
+
+message("All diagnostic compositions saved.")
+
+
+# ==============================================================================
+# 12. VARIANCE INFLATION FACTORS FOR THE CONDITIONAL FIXED EFFECTS
+# ==============================================================================
+
+model_vifs <- function(entry, figure, model_name) {
+  mod <- entry$model
+  X <- model.matrix(mod, component = "cond")
+  V <- as.matrix(vcov(mod)$cond)
+  keep <- rownames(V) != "(Intercept)"
+  R <- cov2cor(V[keep, keep, drop = FALSE])
+  if (any(!is.finite(R))) stop("Non-finite coefficient correlation in ", model_name)
+  
+  column <- match(rownames(R), colnames(X))
+  assignment <- attr(X, "assign")[column]
+  term_labels <- attr(terms(mod, component = "cond"), "term.labels")
+  if (anyNA(assignment) || any(assignment < 1L)) {
+    stop("Cannot match conditional coefficients to terms in ", model_name)
+  }
+  term_for_coef <- term_labels[assignment]
+  
+  # A term and its complement partition the coefficient correlation matrix.
+  log_det <- function(M) {
+    if (nrow(M) == 0L) return(0)
+    2 * sum(log(diag(chol(M))))
+  }
+  log_det_all <- log_det(R)
+  calculate <- function(indices, term, scope) {
+    rest <- setdiff(seq_len(nrow(R)), indices)
+    log_gvif <- log_det(R[indices, indices, drop = FALSE]) +
+      log_det(R[rest, rest, drop = FALSE]) - log_det_all
+    df <- length(indices)
+    data.frame(figure = figure, model = model_name, scope = scope, term = term,
+               df = df, GVIF = exp(log_gvif),
+               GVIF_1_over_2df = exp(log_gvif / (2 * df)),
+               VIF_scale = exp(log_gvif / df))
+  }
+  rows <- lapply(unique(term_for_coef), function(term) {
+    calculate(which(term_for_coef == term), term, "fitted term")
+  })
+  
+  # The two temperature coefficients span the same quadratic in either basis.
+  temperature_terms <- c("temperature", "I(temperature^2)", "poly(temperature, 2)",
+                         "temp_orth1", "temp_orth2")
+  temp <- which(term_for_coef %in% temperature_terms)
+  if (length(temp) == 2L) {
+    rows[[length(rows) + 1L]] <- calculate(temp, "temperature (joint quadratic)", "joint term")
+  }
+  do.call(rbind, rows)
+}
+
+vif_models <- list("4" = models4, "5" = models5, "7" = models7, "8" = models8)
+model_VIFs <- do.call(rbind, lapply(names(vif_models), function(fig) {
+  entries <- vif_models[[fig]]
+  do.call(rbind, lapply(names(entries), function(id) model_vifs(entries[[id]], fig, id)))
+}))
+rownames(model_VIFs) <- NULL
+dir.create("./Diagnostics", recursive = TRUE, showWarnings = FALSE)
+write.csv(model_VIFs, "./Diagnostics/Model_VIFs.csv", row.names = FALSE)
+
+
+
